@@ -1,0 +1,66 @@
+{
+  "id": "rocks.sherwin.mention-notifier",
+  "name": "Mention Notifier",
+  "description": "Sends external HTTP notifications for configured Mattermost @mentions.",
+  "version": "0.2.0",
+  "min_server_version": "10.0.0",
+  "server": {
+    "executable": "plugin"
+  },
+  "settings_schema": {
+    "header": "Mention Notifier configuration",
+    "footer": "Team and channel IDs are Mattermost IDs. Leave both lists empty to monitor every post.",
+    "settings": [
+      {
+        "key": "enabled",
+        "display_name": "Enabled",
+        "type": "bool",
+        "default": "false",
+        "help_text": "Enable external notifications."
+      },
+      {
+        "key": "team_ids",
+        "display_name": "Team IDs",
+        "type": "text",
+        "default": "",
+        "help_text": "Comma-separated Mattermost team IDs. Leave empty for all teams."
+      },
+      {
+        "key": "channel_ids",
+        "display_name": "Channel IDs",
+        "type": "text",
+        "default": "",
+        "help_text": "Comma-separated Mattermost channel IDs. Leave empty for all channels."
+      },
+      {
+        "key": "notify_url",
+        "display_name": "Notification endpoint",
+        "type": "text",
+        "default": "",
+        "help_text": "HTTP or HTTPS endpoint receiving one POST per matched user."
+      },
+      {
+        "key": "csv_file",
+        "display_name": "CSV mapping file",
+        "type": "text",
+        "default": "data.csv",
+        "help_text": "Path to the bundled CSV file, or an absolute path."
+      },
+      {
+        "key": "timeout_seconds",
+        "display_name": "HTTP timeout (seconds)",
+        "type": "number",
+        "default": 10,
+        "help_text": "Maximum time allowed for an external notification request."
+      },
+      {
+        "key": "auth_token",
+        "display_name": "Bearer token",
+        "type": "text",
+        "default": "",
+        "help_text": "Optional token sent as Authorization: Bearer <token>.",
+        "secret": true
+      }
+    ]
+  }
+}
