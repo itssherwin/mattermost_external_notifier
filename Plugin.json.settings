@@ -1,0 +1,43 @@
+{
+  "settings": [
+    {
+      "key": "Provider",
+      "display_name": "Notification provider",
+      "type": "radio",
+      "options": [
+        { "display_name": "Generic HTTP webhook", "value": "generic" },
+        { "display_name": "KavehNegar SMS", "value": "kavenegar" }
+      ],
+      "default": "generic",
+      "help_text": "Choose how notifications are delivered. Generic posts JSON to Notification endpoint. KavehNegar sends an SMS via the KavehNegar REST API."
+    },
+    {
+      "key": "KavenegarAPIKey",
+      "display_name": "KavehNegar API key",
+      "type": "text",
+      "secret": true,
+      "help_text": "Your KavehNegar API key, from https://panel.kavenegar.com/client/setting/account. Required when Provider is KavehNegar SMS."
+    },
+    {
+      "key": "KavenegarSender",
+      "display_name": "KavehNegar sender line",
+      "type": "text",
+      "placeholder": "10008663",
+      "help_text": "Optional. The sender line/number configured on your KavehNegar account. Leave blank to use your account default."
+    },
+    {
+      "key": "KavenegarTemplate",
+      "display_name": "SMS message template",
+      "type": "text",
+      "placeholder": "You were mentioned by @{{user}}: {{message}}",
+      "help_text": "Optional. Use {{user}} and {{message}} as placeholders. If left blank, a default template is used."
+    },
+    {
+      "key": "ExpandGroupMentions",
+      "display_name": "Expand @group mentions to members",
+      "type": "bool",
+      "default": true,
+      "help_text": "When enabled, mentioning a Mattermost Group (e.g. @on-call) notifies every member of that group, in addition to plain @username mentions."
+    }
+  ]
+}
