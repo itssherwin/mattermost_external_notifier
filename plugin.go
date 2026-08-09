@@ -25,16 +25,25 @@ const (
 	providerGeneric   = "generic"
 	providerKavenegar = "kavenegar"
 
-	kavenegarBaseURL = "https://api.kavenegar.com/v1/%s/sms/send.json"
+	defaultKavenegarAPIBase = "https://api.kavenegar.com/v1"
+
+	// Environment variable names. Set these in the environment the
+	// Mattermost server process runs in, or via a .env file placed beside
+	// the plugin executable (see loadDotEnvFile). Values found here take
+	// priority over the corresponding System Console setting, so secrets
+	// never need to be stored in config.json.
+	envKavenegarAPIKey = "KAVENEGAR_API_KEY"
+	envKavenegarAPIURL = "KAVENEGAR_API_URL"
 )
 
 type Plugin struct {
 	plugin.MattermostPlugin
 
-	mu     sync.RWMutex
-	table  map[string]string
-	config Configuration
-	client *http.Client
+	mu       sync.RWMutex
+	table    map[string]string
+	config   Configuration
+	client   *http.Client
+	debugLog *fileLogger
 
 	wg sync.WaitGroup
 }
@@ -56,6 +65,7 @@ type Configuration struct {
 
 	// KavehNegar provider settings.
 	KavenegarAPIKey   string `json:"kavenegar_api_key"`
+	KavenegarAPIURL   string `json:"kavenegar_api_url"`
 	KavenegarSender   string `json:"kavenegar_sender"`
 	KavenegarTemplate string `json:"kavenegar_message_template"`
 
@@ -66,6 +76,14 @@ type Configuration struct {
 	// a real Mattermost Group to notify every member of that group, in
 	// addition to (or instead of) a plain @username mention.
 	ExpandGroupMentions bool `json:"expand_group_mentions"`
+
+	// DebugLogging, when true, appends verbose diagnostics (tagged
+	// messages, extracted mentions, resolved usernames and numbers, and
+	// delivery response codes) to DebugLogPath. This log includes
+	// notification numbers and post content in plain text - see the
+	// Security section of the README before enabling it in production.
+	DebugLogging bool   `json:"debug_logging"`
+	DebugLogPath string `json:"debug_log_path"`
 }
 
 type Notification struct {
@@ -87,7 +105,50 @@ type kavenegarResponse struct {
 	} `json:"return"`
 }
 
+// fileLogger appends timestamped lines to a single log file. It's
+// intentionally simple (no rotation) - point DebugLogPath at a path
+// managed by an external log rotator (logrotate, etc.) for long-running
+// deployments.
+type fileLogger struct {
+	mu sync.Mutex
+	f  *os.File
+}
+
+func openFileLogger(path string) (*fileLogger, error) {
+	if path == "" {
+		return nil, errors.New("empty log path")
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return &fileLogger{f: f}, nil
+}
+
+func (l *fileLogger) Printf(format string, args ...interface{}) {
+	if l == nil || l.f == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Fprintf(l.f, "%s "+format+"\n", append(
+		[]interface{}{time.Now().UTC().Format(time.RFC3339)}, args...,
+	)...)
+}
+
+func (l *fileLogger) Close() error {
+	if l == nil || l.f == nil {
+		return nil
+	}
+	return l.f.Close()
+}
+
 func (p *Plugin) OnActivate() error {
+	loadDotEnvFile(defaultDotEnvPath())
+
 	p.setClient(&http.Client{Timeout: defaultTimeoutSeconds * time.Second})
 
 	p.mu.Lock()
@@ -100,8 +161,70 @@ func (p *Plugin) OnActivate() error {
 	return nil
 }
 
+// defaultDebugLogPath returns the default debug log location beside the
+// plugin executable, used when DebugLogPath is left blank.
+func defaultDebugLogPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "mention-notifier-debug.log"
+	}
+	return filepath.Join(filepath.Dir(exe), "mention-notifier-debug.log")
+}
+
+// defaultDotEnvPath returns the path to an optional .env file living
+// beside the plugin executable, mirroring how CSVPath resolves relative
+// paths.
+func defaultDotEnvPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(exe), ".env")
+}
+
+// loadDotEnvFile reads simple KEY=VALUE lines from path and applies them
+// to the process environment via os.Setenv, skipping blank lines,
+// '#'-prefixed comments, and any key that's already set in the
+// environment (explicit environment variables always win over the file).
+// Missing files are silently ignored - the .env file is optional.
+func loadDotEnvFile(path string) {
+	if path == "" {
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		if key == "" {
+			continue
+		}
+		if _, alreadySet := os.LookupEnv(key); alreadySet {
+			continue
+		}
+
+		value := strings.TrimSpace(parts[1])
+		value = strings.Trim(value, `"'`)
+		os.Setenv(key, value)
+	}
+}
+
 func (p *Plugin) OnDeactivate() error {
 	p.wg.Wait()
+	p.setDebugLog(nil)
 	return nil
 }
 
@@ -118,6 +241,7 @@ func (p *Plugin) reloadConfiguration() error {
 	config.TeamIDs = normalizeIDList(config.TeamIDs)
 	config.ChannelIDs = normalizeIDList(config.ChannelIDs)
 	config.Provider = normalizeProvider(config.Provider)
+	applyKavenegarEnvOverrides(&config)
 
 	if err := validateConfiguration(config); err != nil {
 		return err
@@ -142,6 +266,23 @@ func (p *Plugin) reloadConfiguration() error {
 	// with this write (previously a data race).
 	p.setClient(&http.Client{Timeout: timeout})
 
+	if config.DebugLogging {
+		path := strings.TrimSpace(config.DebugLogPath)
+		if path == "" {
+			path = defaultDebugLogPath()
+		}
+		logger, err := openFileLogger(path)
+		if err != nil {
+			p.API.LogError("failed to open debug log file", "path", path, "error", err.Error())
+			p.setDebugLog(nil)
+		} else {
+			p.setDebugLog(logger)
+			p.API.LogInfo("debug logging enabled", "path", path)
+		}
+	} else {
+		p.setDebugLog(nil)
+	}
+
 	p.API.LogInfo(
 		"mention notifier configuration loaded",
 		"provider", config.Provider,
@@ -164,6 +305,35 @@ func (p *Plugin) getClient() *http.Client {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.client
+}
+
+// setDebugLog swaps in a new debug log file, closing the previous one (if
+// any) after releasing the lock so a slow Close() never blocks readers.
+func (p *Plugin) setDebugLog(l *fileLogger) {
+	p.mu.Lock()
+	old := p.debugLog
+	p.debugLog = l
+	p.mu.Unlock()
+
+	if old != nil {
+		if err := old.Close(); err != nil {
+			p.API.LogError("failed to close debug log file", "error", err.Error())
+		}
+	}
+}
+
+func (p *Plugin) getDebugLog() *fileLogger {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.debugLog
+}
+
+// debugf writes a line to the debug log file if DebugLogging is enabled.
+// No-op (and cheap) when disabled.
+func (p *Plugin) debugf(format string, args ...interface{}) {
+	if l := p.getDebugLog(); l != nil {
+		l.Printf(format, args...)
+	}
 }
 
 func (p *Plugin) MessageHasBeenPosted(
@@ -213,6 +383,11 @@ func (p *Plugin) MessageHasBeenPosted(
 		return
 	}
 
+	p.debugf(
+		"TAGGED post_id=%s channel_id=%s team_id=%s mentions=%v message=%q",
+		post.Id, post.ChannelId, teamID, mentions, post.Message,
+	)
+
 	seen := make(map[string]struct{}, len(mentions))
 	for _, token := range mentions {
 		targets := []string{token}
@@ -222,6 +397,7 @@ func (p *Plugin) MessageHasBeenPosted(
 				// token matched a real Mattermost Group: notify its
 				// members instead of treating "token" as a username.
 				targets = members
+				p.debugf("GROUP token=%s members=%v", token, members)
 			}
 		}
 
@@ -241,8 +417,11 @@ func (p *Plugin) MessageHasBeenPosted(
 					"mentioned user has no CSV mapping",
 					"username", name,
 				)
+				p.debugf("EXTRACTED user=%s from_token=%s number=<no csv mapping>", name, token)
 				continue
 			}
+
+			p.debugf("EXTRACTED user=%s from_token=%s number=%s", name, token, number)
 
 			p.wg.Add(1)
 			go func(name, number, teamID string, post *model.Post, config Configuration) {
@@ -459,9 +638,12 @@ func (p *Plugin) notifyGeneric(
 			"name", name,
 			"error", err.Error(),
 		)
+		p.debugf("GENERIC RESPONSE user=%s number=%s error=%s", name, number, err.Error())
 		return
 	}
 	defer resp.Body.Close()
+
+	p.debugf("GENERIC RESPONSE user=%s number=%s http_status=%d", name, number, resp.StatusCode)
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		p.API.LogError(
@@ -470,6 +652,31 @@ func (p *Plugin) notifyGeneric(
 			"status", resp.Status,
 		)
 	}
+}
+
+// applyKavenegarEnvOverrides lets KAVENEGAR_API_KEY / KAVENEGAR_API_URL in
+// the process environment (or a .env file, see loadDotEnvFile) take
+// priority over the same values configured in the System Console. This
+// keeps the API key out of config.json.
+func applyKavenegarEnvOverrides(config *Configuration) {
+	if v := strings.TrimSpace(os.Getenv(envKavenegarAPIKey)); v != "" {
+		config.KavenegarAPIKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv(envKavenegarAPIURL)); v != "" {
+		config.KavenegarAPIURL = v
+	}
+}
+
+// kavenegarEndpoint builds the "sms/send.json" URL for the given API key,
+// using config.KavenegarAPIURL as the base if set, otherwise falling back
+// to KavehNegar's default API host.
+func kavenegarEndpoint(config Configuration, apiKey string) string {
+	base := strings.TrimSpace(config.KavenegarAPIURL)
+	if base == "" {
+		base = defaultKavenegarAPIBase
+	}
+	base = strings.TrimRight(base, "/")
+	return fmt.Sprintf("%s/%s/sms/send.json", base, url.PathEscape(apiKey))
 }
 
 // notifyKavenegar sends an SMS via the KavehNegar REST API:
@@ -495,7 +702,7 @@ func (p *Plugin) notifyKavenegar(
 
 	message := renderKavenegarMessage(config.KavenegarTemplate, name, post.Message)
 
-	endpoint := fmt.Sprintf(kavenegarBaseURL, url.PathEscape(apiKey))
+	endpoint := kavenegarEndpoint(config, apiKey)
 
 	q := url.Values{}
 	q.Set("receptor", receptor)
@@ -517,9 +724,20 @@ func (p *Plugin) notifyKavenegar(
 			"name", name,
 			"error", err.Error(),
 		)
+		p.debugf("KAVENEGAR RESPONSE user=%s number=%s error=%s", name, number, err.Error())
 		return
 	}
 	defer resp.Body.Close()
+
+	// KavehNegar returns HTTP 200 even for some API-level errors (e.g. bad
+	// credit, invalid sender), so the response body must be checked too.
+	var parsed kavenegarResponse
+	decodeErr := json.NewDecoder(resp.Body).Decode(&parsed)
+
+	p.debugf(
+		"KAVENEGAR RESPONSE user=%s number=%s http_status=%d api_status=%d api_message=%q decode_error=%v",
+		name, number, resp.StatusCode, parsed.Return.Status, parsed.Return.Message, decodeErr,
+	)
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		p.API.LogError(
@@ -530,13 +748,11 @@ func (p *Plugin) notifyKavenegar(
 		return
 	}
 
-	// KavehNegar returns HTTP 200 even for some API-level errors (e.g. bad
-	// credit, invalid sender), so the response body must be checked too.
-	var parsed kavenegarResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		p.API.LogError("failed to decode kavenegar response", "error", err.Error())
+	if decodeErr != nil {
+		p.API.LogError("failed to decode kavenegar response", "error", decodeErr.Error())
 		return
 	}
+
 	if parsed.Return.Status != http.StatusOK {
 		p.API.LogError(
 			"kavenegar rejected the message",
