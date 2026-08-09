@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -22,47 +20,9 @@ import (
 )
 
 const (
-	defaultCSVFile     = "data.csv"
-	defaultTimeout     = 10 * time.Second
-	maxCSVRecordFields = 2
+	defaultTimeoutSeconds = 10
+	maxTimeoutSeconds     = 120
 )
-
-// StringList accepts either a comma-separated string (the System Console
-// representation) or a JSON string array (useful for direct configuration).
-type StringList []string
-
-func (s *StringList) UnmarshalJSON(data []byte) error {
-	var list []string
-	if err := json.Unmarshal(data, &list); err == nil {
-		*s = normalizeIDList(list)
-		return nil
-	}
-
-	var value string
-	if err := json.Unmarshal(data, &value); err != nil {
-		return fmt.Errorf("expected string or string array: %w", err)
-	}
-
-	*s = normalizeIDList(strings.Split(value, ","))
-	return nil
-}
-
-func normalizeIDList(values []string) []string {
-	result := make([]string, 0, len(values))
-	seen := make(map[string]struct{}, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		result = append(result, value)
-	}
-	return result
-}
 
 type Plugin struct {
 	plugin.MattermostPlugin
@@ -70,18 +30,19 @@ type Plugin struct {
 	mu     sync.RWMutex
 	table  map[string]string
 	config Configuration
+
 	client *http.Client
 	wg     sync.WaitGroup
 }
 
 type Configuration struct {
-	Enabled        bool       `json:"enabled"`
-	TeamIDs        StringList `json:"team_ids"`
-	ChannelIDs     StringList `json:"channel_ids"`
-	NotifyURL      string     `json:"notify_url"`
-	CSVFile        string     `json:"csv_file"`
-	TimeoutSeconds int        `json:"timeout_seconds"`
-	AuthToken      string     `json:"auth_token"`
+	Enabled        bool     `json:"enabled"`
+	TeamIDs        []string `json:"team_ids"`
+	ChannelIDs     []string `json:"channel_ids"`
+	NotifyURL      string   `json:"notify_url"`
+	AuthToken      string   `json:"auth_token"`
+	CSVPath        string   `json:"csv_path"`
+	TimeoutSeconds int      `json:"timeout_seconds"`
 }
 
 type Notification struct {
@@ -95,63 +56,110 @@ type Notification struct {
 }
 
 func (p *Plugin) OnActivate() error {
-	p.client = &http.Client{Timeout: defaultTimeout}
+	p.client = &http.Client{
+		Timeout: defaultTimeoutSeconds * time.Second,
+	}
+	p.config = defaultConfiguration()
 
-	if err := p.OnConfigurationChange(); err != nil {
+	if err := p.reloadConfiguration(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
+func (p *Plugin) OnDeactivate() error {
+	p.wg.Wait()
+	return nil
+}
+
 func (p *Plugin) OnConfigurationChange() error {
-	config := Configuration{}
+	return p.reloadConfiguration()
+}
+
+func (p *Plugin) reloadConfiguration() error {
+	config := defaultConfiguration()
+
 	if err := p.API.LoadPluginConfiguration(&config); err != nil {
 		return fmt.Errorf("load plugin configuration: %w", err)
 	}
 
-	applyEnvironmentDefaults(&config)
+	config.TeamIDs = normalizeIDList(config.TeamIDs)
+	config.ChannelIDs = normalizeIDList(config.ChannelIDs)
 
 	if err := validateConfiguration(config); err != nil {
 		return err
 	}
 
-	timeout := requestTimeout(config)
+	table, err := loadCSV(config.CSVPath)
+	if err != nil {
+		return fmt.Errorf("load CSV: %w", err)
+	}
+
+	timeout := time.Duration(config.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = defaultTimeoutSeconds * time.Second
+	}
 
 	p.mu.Lock()
 	p.config = config
-	p.client = &http.Client{Timeout: timeout}
+	p.table = table
 	p.mu.Unlock()
 
-	if err := p.loadCSV(config.CSVFile); err != nil {
-		return fmt.Errorf("load CSV mapping: %w", err)
-	}
+	p.client = &http.Client{Timeout: timeout}
 
 	p.API.LogInfo(
 		"mention notifier configuration loaded",
-		"enabled", config.Enabled,
 		"teams", len(config.TeamIDs),
 		"channels", len(config.ChannelIDs),
+		"csv_entries", len(table),
+		"timeout_seconds", config.TimeoutSeconds,
 	)
 
 	return nil
-}
-
-func (p *Plugin) OnDeactivate() {
-	p.wg.Wait()
 }
 
 func (p *Plugin) MessageHasBeenPosted(
 	_ *plugin.Context,
 	post *model.Post,
 ) {
+	if post == nil {
+		return
+	}
+
 	config := p.getConfiguration()
 
 	if !config.Enabled {
 		return
 	}
 
-	if !p.isMonitoredScope(post.TeamId, post.ChannelId, config.TeamIDs, config.ChannelIDs) {
+	channel, appErr := p.API.GetChannel(post.ChannelId)
+	if appErr != nil {
+		p.API.LogError(
+			"failed to resolve channel for post",
+			"channel_id", post.ChannelId,
+			"error", appErr.Error(),
+		)
+		return
+	}
+
+	if channel == nil {
+		p.API.LogError(
+			"failed to resolve channel for post",
+			"channel_id", post.ChannelId,
+			"error", "channel was nil",
+		)
+		return
+	}
+
+	teamID := channel.TeamId
+
+	if !p.isMonitoredScope(
+		teamID,
+		post.ChannelId,
+		config.TeamIDs,
+		config.ChannelIDs,
+	) {
 		return
 	}
 
@@ -161,28 +169,39 @@ func (p *Plugin) MessageHasBeenPosted(
 	}
 
 	seen := make(map[string]struct{}, len(mentions))
+
 	for _, name := range mentions {
-		name = normalizeUsername(name)
+		name = strings.ToLower(strings.TrimSpace(name))
+
 		if name == "" {
 			continue
 		}
 
-		if _, ok := seen[name]; ok {
+		if _, exists := seen[name]; exists {
 			continue
 		}
 		seen[name] = struct{}{}
 
 		number := p.lookup(name)
 		if number == "" {
-			p.API.LogDebug("mentioned user not found in CSV", "username", name)
+			p.API.LogDebug(
+				"mentioned user has no CSV mapping",
+				"username", name,
+			)
 			continue
 		}
 
 		p.wg.Add(1)
-		go func(name, number string, post *model.Post, config Configuration) {
+		go func(
+			name string,
+			number string,
+			teamID string,
+			post *model.Post,
+			config Configuration,
+		) {
 			defer p.wg.Done()
-			p.notify(config, name, number, post)
-		}(name, number, post, config)
+			p.notify(config, name, number, teamID, post)
+		}(name, number, teamID, post, config)
 	}
 }
 
@@ -199,19 +218,23 @@ func (p *Plugin) isMonitoredScope(
 	teamIDs []string,
 	channelIDs []string,
 ) bool {
-	teamMatch := len(teamIDs) == 0 || contains(teamIDs, teamID)
-	channelMatch := len(channelIDs) == 0 || contains(channelIDs, channelID)
+	teamMatch := matchesConfiguredID(teamID, teamIDs)
+	channelMatch := matchesConfiguredID(channelID, channelIDs)
 
-	// Empty means "all". If both filters are configured, both must match.
 	return teamMatch && channelMatch
 }
 
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if strings.TrimSpace(value) == target {
+func matchesConfiguredID(value string, configured []string) bool {
+	if len(configured) == 0 {
+		return true
+	}
+
+	for _, item := range configured {
+		if item == value {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -222,24 +245,21 @@ func (p *Plugin) lookup(name string) string {
 	return p.table[name]
 }
 
-func (p *Plugin) loadCSV(filename string) error {
-	filename = strings.TrimSpace(filename)
-	if filename == "" {
-		filename = defaultCSVFile
-	}
+func loadCSV(configuredPath string) (map[string]string, error) {
+	filename := strings.TrimSpace(configuredPath)
 
-	path := filename
-	if !filepath.IsAbs(path) {
+	if filename == "" {
 		exe, err := os.Executable()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		path = filepath.Join(filepath.Dir(exe), path)
+
+		filename = filepath.Join(filepath.Dir(exe), "data.csv")
 	}
 
-	file, err := os.Open(path)
+	file, err := os.Open(filename)
 	if err != nil {
-		return fmt.Errorf("open %q: %w", path, err)
+		return nil, err
 	}
 	defer file.Close()
 
@@ -248,27 +268,23 @@ func (p *Plugin) loadCSV(filename string) error {
 
 	records, err := reader.ReadAll()
 	if err != nil {
-		return fmt.Errorf("read %q: %w", path, err)
-	}
-	if len(records) == 0 {
-		return fmt.Errorf("%q is empty", path)
+		return nil, err
 	}
 
-	table := make(map[string]string, len(records)-1)
-	start := 0
-	if isCSVHeader(records[0]) {
-		start = 1
-	}
+	table := make(map[string]string)
 
-	for i := start; i < len(records); i++ {
-		row := records[i]
-		if len(row) < maxCSVRecordFields {
-			p.API.LogWarn("skipping CSV row with fewer than two fields", "row", i+1)
+	for i, row := range records {
+		if len(row) < 2 {
 			continue
 		}
 
 		name := normalizeUsername(row[0])
 		number := strings.TrimSpace(row[1])
+
+		if i == 0 && isCSVHeader(name, number) {
+			continue
+		}
+
 		if name == "" || number == "" {
 			continue
 		}
@@ -276,34 +292,40 @@ func (p *Plugin) loadCSV(filename string) error {
 		table[name] = number
 	}
 
-	if len(table) == 0 {
-		return fmt.Errorf("%q contains no usable mappings", path)
-	}
-
-	p.mu.Lock()
-	p.table = table
-	p.mu.Unlock()
-
-	return nil
+	return table, nil
 }
 
-func isCSVHeader(row []string) bool {
-	if len(row) < 2 {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(row[0]), "mention") &&
-		strings.EqualFold(strings.TrimSpace(row[1]), "number")
+func isCSVHeader(name, number string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	number = strings.ToLower(strings.TrimSpace(number))
+
+	return (name == "username" || name == "user" || name == "name") &&
+		(number == "number" || number == "phone" || number == "phone_number")
+}
+
+func normalizeUsername(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimPrefix(value, "@")
+	return value
 }
 
 func (p *Plugin) notify(
 	config Configuration,
 	name string,
 	number string,
+	teamID string,
 	post *model.Post,
 ) {
-	baseURL, err := validatedNotifyURL(config.NotifyURL)
+	if post == nil {
+		return
+	}
+
+	u, err := url.Parse(strings.TrimSpace(config.NotifyURL))
 	if err != nil {
-		p.API.LogError("invalid notification URL", "error", err.Error())
+		p.API.LogError(
+			"invalid notification URL",
+			"error", err.Error(),
+		)
 		return
 	}
 
@@ -312,44 +334,56 @@ func (p *Plugin) notify(
 		Number:    number,
 		PostID:    post.Id,
 		UserID:    post.UserId,
-		TeamID:    post.TeamId,
+		TeamID:    teamID,
 		ChannelID: post.ChannelId,
 		Message:   post.Message,
 	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		p.API.LogError("failed to encode notification", "error", err.Error())
+		p.API.LogError(
+			"failed to encode notification",
+			"error", err.Error(),
+		)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout(config))
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(body))
+	req, err := http.NewRequest(
+		http.MethodPost,
+		u.String(),
+		strings.NewReader(string(body)),
+	)
 	if err != nil {
-		p.API.LogError("failed to create notification request", "error", err.Error())
+		p.API.LogError(
+			"failed to create HTTP request",
+			"error", err.Error(),
+		)
 		return
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "mattermost-mention-notifier/1")
 
 	if token := strings.TrimSpace(config.AuthToken); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	p.mu.RLock()
 	client := p.client
-	p.mu.RUnlock()
 	if client == nil {
-		client = &http.Client{Timeout: requestTimeout(config)}
+		timeout := time.Duration(config.TimeoutSeconds) * time.Second
+		if timeout <= 0 {
+			timeout = defaultTimeoutSeconds * time.Second
+		}
+		client = &http.Client{Timeout: timeout}
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		p.API.LogError("notification request failed", "name", name, "error", err.Error())
+		p.API.LogError(
+			"notification request failed",
+			"name", name,
+			"number", number,
+			"error", err.Error(),
+		)
 		return
 	}
 	defer resp.Body.Close()
@@ -361,96 +395,118 @@ func (p *Plugin) notify(
 			"number", number,
 			"status", resp.Status,
 		)
-		return
-	}
-
-	p.API.LogDebug("notification sent", "name", name, "status", resp.Status)
-}
-
-func requestTimeout(config Configuration) time.Duration {
-	if config.TimeoutSeconds > 0 {
-		return time.Duration(config.TimeoutSeconds) * time.Second
-	}
-	return defaultTimeout
-}
-
-func validatedNotifyURL(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", errors.New("notify_url is required")
-	}
-
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("parse URL: %w", err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", errors.New("URL scheme must be http or https")
-	}
-	if u.Host == "" {
-		return "", errors.New("URL host is required")
-	}
-	return u.String(), nil
-}
-
-func validateConfiguration(config Configuration) error {
-	if config.TimeoutSeconds < 0 {
-		return errors.New("timeout_seconds cannot be negative")
-	}
-
-	if config.Enabled {
-		if _, err := validatedNotifyURL(config.NotifyURL); err != nil {
-			return fmt.Errorf("invalid notify_url: %w", err)
-		}
-	}
-	return nil
-}
-
-func applyEnvironmentDefaults(config *Configuration) {
-	if strings.TrimSpace(config.NotifyURL) == "" {
-		config.NotifyURL = strings.TrimSpace(os.Getenv("MENTION_NOTIFIER_NOTIFY_URL"))
-	}
-	if strings.TrimSpace(config.CSVFile) == "" {
-		if value := strings.TrimSpace(os.Getenv("MENTION_NOTIFIER_CSV_FILE")); value != "" {
-			config.CSVFile = value
-		}
-	}
-	if config.TimeoutSeconds == 0 {
-		if value := strings.TrimSpace(os.Getenv("MENTION_NOTIFIER_TIMEOUT_SECONDS")); value != "" {
-			if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
-				config.TimeoutSeconds = seconds
-			}
-		}
-	}
-	if strings.TrimSpace(config.AuthToken) == "" {
-		config.AuthToken = strings.TrimSpace(os.Getenv("MENTION_NOTIFIER_AUTH_TOKEN"))
 	}
 }
 
-var mentionRegexp = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.-])@([A-Za-z0-9_.-]+)`)
+var mentionRegexp = regexp.MustCompile(
+	`(?i)(?:^|[^a-zA-Z0-9_])@([a-zA-Z0-9][a-zA-Z0-9_.-]*)`,
+)
 
 func extractMentions(message string) []string {
 	matches := mentionRegexp.FindAllStringSubmatch(message, -1)
+
 	result := make([]string, 0, len(matches))
+	seen := make(map[string]struct{})
 
 	for _, match := range matches {
-		if len(match) > 1 {
-			name := normalizeUsername(match[1])
-			switch name {
-			case "", "all", "channel", "here":
-				continue
-			default:
-				result = append(result, name)
-			}
+		if len(match) < 2 {
+			continue
+		}
+
+		name := normalizeUsername(match[1])
+		if name == "" || isSpecialMention(name) {
+			continue
+		}
+
+		if _, exists := seen[name]; exists {
+			continue
+		}
+
+		seen[name] = struct{}{}
+		result = append(result, name)
+	}
+
+	return result
+}
+
+func isSpecialMention(name string) bool {
+	switch strings.ToLower(name) {
+	case "all", "channel", "here":
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultConfiguration() Configuration {
+	return Configuration{
+		Enabled:        false,
+		CSVPath:        "data.csv",
+		TimeoutSeconds: defaultTimeoutSeconds,
+	}
+}
+
+func validateConfiguration(config Configuration) error {
+	if !config.Enabled {
+		return nil
+	}
+
+	if err := validateNotifyURL(config.NotifyURL); err != nil {
+		return err
+	}
+
+	if config.TimeoutSeconds < 1 || config.TimeoutSeconds > maxTimeoutSeconds {
+		return fmt.Errorf(
+			"timeout_seconds must be between 1 and %d",
+			maxTimeoutSeconds,
+		)
+	}
+
+	return nil
+}
+
+func validateNotifyURL(rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return errors.New("notify_url is required when the plugin is enabled")
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid notify_url: %w", err)
+	}
+
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("notify_url must use http or https")
+	}
+
+	if u.Host == "" {
+		return errors.New("notify_url must include a host")
+	}
+
+	return nil
+}
+
+func normalizeIDList(values []string) []string {
+	result := make([]string, 0, len(values))
+
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			result = append(result, value)
 		}
 	}
 
 	return result
 }
 
-func normalizeUsername(name string) string {
-	name = strings.TrimSpace(strings.ToLower(name))
-	return strings.TrimPrefix(name, "@")
+func parseTimeout(value string) int {
+	timeout, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || timeout <= 0 {
+		return defaultTimeoutSeconds
+	}
+
+	return timeout
 }
 
 func main() {
