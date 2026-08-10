@@ -238,6 +238,7 @@ func defaultDotEnvPath() string {
 	return filepath.Join(filepath.Dir(exe), ".env")
 }
 
+
 func loadDotEnvFile(path string) {
 	if path == "" {
 		return
@@ -265,17 +266,34 @@ func loadDotEnvFile(path string) {
 			continue
 		}
 
-		// Explicit process environment wins over .env.
-		if _, exists := os.LookupEnv(key); exists {
+		// Explicit process environment variables always win.
+		if _, alreadySet := os.LookupEnv(key); alreadySet {
 			continue
 		}
 
 		value := strings.TrimSpace(parts[1])
-		value = strings.Trim(value, `"'`)
 
-		_ = os.Setenv(key, value)
+		// Remove matching surrounding quotes.
+		if len(value) >= 2 {
+			first := value[0]
+			last := value[len(value)-1]
+
+			if (first == '\'' && last == '\'') ||
+				(first == '"' && last == '"') {
+				value = value[1 : len(value)-1]
+			}
+		}
+
+		// Support escaped newlines in .env values.
+		value = strings.ReplaceAll(value, `\n`, "\n")
+		value = strings.ReplaceAll(value, `\r`, "\r")
+		value = strings.ReplaceAll(value, `\t`, "\t")
+
+		os.Setenv(key, value)
 	}
 }
+
+
 
 func (p *Plugin) reloadConfiguration() error {
 	config := defaultConfiguration()
