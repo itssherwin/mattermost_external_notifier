@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,13 +29,23 @@ const (
 
 	defaultKavenegarAPIBase = "https://api.kavenegar.com/v1"
 
-	// Environment variable names. Set these in the environment the
-	// Mattermost server process runs in, or via a .env file placed beside
-	// the plugin executable (see loadDotEnvFile). Values found here take
-	// priority over the corresponding System Console setting, so secrets
-	// never need to be stored in config.json.
-	envKavenegarAPIKey = "KAVENEGAR_API_KEY"
-	envKavenegarAPIURL = "KAVENEGAR_API_URL"
+	envNotifierEnabled      = "MENTION_NOTIFIER_ENABLED"
+	envNotifierTeamIDs      = "MENTION_NOTIFIER_TEAM_IDS"
+	envNotifierChannelIDs   = "MENTION_NOTIFIER_CHANNEL_IDS"
+	envNotifierProvider     = "MENTION_NOTIFIER_PROVIDER"
+	envNotifierNotifyURL    = "MENTION_NOTIFIER_NOTIFY_URL"
+	envNotifierAuthToken    = "MENTION_NOTIFIER_AUTH_TOKEN"
+	envNotifierCSVFile      = "MENTION_NOTIFIER_CSV_FILE"
+	envNotifierTimeout      = "MENTION_NOTIFIER_TIMEOUT_SECONDS"
+	envNotifierExpandGroups = "MENTION_NOTIFIER_EXPAND_GROUPS"
+	envNotifierDebugLogging = "MENTION_NOTIFIER_DEBUG_LOGGING"
+	envNotifierDebugLogPath = "MENTION_NOTIFIER_DEBUG_LOG_PATH"
+	envNotifierText          = "MENTION_NOTIFIER_TEXT"
+
+	envKavenegarAPIKey       = "KAVENEGAR_API_KEY"
+	envKavenegarAPIURL       = "KAVENEGAR_API_URL"
+	envKavenegarSender       = "KAVENEGAR_SENDER"
+	envKavenegarTemplate     = "KAVENEGAR_TEMPLATE"
 )
 
 type Plugin struct {
@@ -48,42 +60,60 @@ type Plugin struct {
 	wg sync.WaitGroup
 }
 
-type Configuration struct {
-	Enabled bool `json:"enabled"`
+type stringList []string
 
-	TeamIDs    []string `json:"team_ids"`
-	ChannelIDs []string `json:"channel_ids"`
+func (s *stringList) UnmarshalJSON(data []byte) error {
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*s = arr
+		return nil
+	}
+
+	var single string
+	if err := json.Unmarshal(data, &single); err != nil {
+		return err
+	}
+
+	*s = parseEnvIDList(single)
+	return nil
+}
+
+type Configuration struct {
+	Enabled bool `json:"Enabled"`
+
+	TeamIDs    stringList `json:"TeamIDs"`
+	ChannelIDs stringList `json:"ChannelIDs"`
 
 	// Provider selects how a notification is delivered.
-	// "generic"   -> JSON POST to NotifyURL (original behavior)
+	// "generic"   -> JSON POST to NotifyURL
 	// "kavenegar" -> KavehNegar SMS REST API
-	Provider string `json:"provider"`
+	Provider string `json:"Provider"`
 
 	// Generic webhook provider settings.
-	NotifyURL string `json:"notify_url"`
-	AuthToken string `json:"auth_token"`
+	NotifyURL string `json:"NotifyURL"`
+	AuthToken string `json:"AuthToken"`
 
 	// KavehNegar provider settings.
-	KavenegarAPIKey   string `json:"kavenegar_api_key"`
-	KavenegarAPIURL   string `json:"kavenegar_api_url"`
-	KavenegarSender   string `json:"kavenegar_sender"`
-	KavenegarTemplate string `json:"kavenegar_message_template"`
+	KavenegarAPIKey   string `json:"KavenegarAPIKey"`
+	KavenegarAPIURL   string `json:"KavenegarAPIURL"`
+	KavenegarSender   string `json:"KavenegarSender"`
+	KavenegarTemplate string `json:"KavenegarTemplate"`
 
-	CSVPath        string `json:"csv_path"`
-	TimeoutSeconds int    `json:"timeout_seconds"`
+	// MENTION_NOTIFIER_TEXT overrides the SMS text.
+	//
+	// Supported placeholders:
+	//   {{user}}    - Mattermost user who created the post
+	//   {{channel}} - Mattermost channel name
+	//   {{message}} - original Mattermost post message
+	Text string `json:"Text"`
 
-	// ExpandGroupMentions, when true, causes @group-name mentions that match
-	// a real Mattermost Group to notify every member of that group, in
-	// addition to (or instead of) a plain @username mention.
-	ExpandGroupMentions bool `json:"expand_group_mentions"`
+	CSVPath        string `json:"CSVPath"`
+	TimeoutSeconds int    `json:"TimeoutSeconds"`
 
-	// DebugLogging, when true, appends verbose diagnostics (tagged
-	// messages, extracted mentions, resolved usernames and numbers, and
-	// delivery response codes) to DebugLogPath. This log includes
-	// notification numbers and post content in plain text - see the
-	// Security section of the README before enabling it in production.
-	DebugLogging bool   `json:"debug_logging"`
-	DebugLogPath string `json:"debug_log_path"`
+	ExpandGroupMentions bool `json:"ExpandGroupMentions"`
+
+	DebugLogging bool   `json:"DebugLogging"`
+	DebugLogPath string `json:"DebugLogPath"`
 }
 
 type Notification struct {
@@ -96,8 +126,6 @@ type Notification struct {
 	Message   string `json:"message"`
 }
 
-// kavenegarResponse mirrors the small slice of KavehNegar's response we
-// care about for error reporting. See https://kavenegar.com/rest.html
 type kavenegarResponse struct {
 	Return struct {
 		Status  int    `json:"status"`
@@ -105,10 +133,6 @@ type kavenegarResponse struct {
 	} `json:"return"`
 }
 
-// fileLogger appends timestamped lines to a single log file. It's
-// intentionally simple (no rotation) - point DebugLogPath at a path
-// managed by an external log rotator (logrotate, etc.) for long-running
-// deployments.
 type fileLogger struct {
 	mu sync.Mutex
 	f  *os.File
@@ -118,13 +142,22 @@ func openFileLogger(path string) (*fileLogger, error) {
 	if path == "" {
 		return nil, errors.New("empty log path")
 	}
+
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0o755)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+
+	f, err := os.OpenFile(
+		path,
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY,
+		0o644,
+	)
 	if err != nil {
 		return nil, err
 	}
+
 	return &fileLogger{f: f}, nil
 }
 
@@ -132,24 +165,34 @@ func (l *fileLogger) Printf(format string, args ...interface{}) {
 	if l == nil || l.f == nil {
 		return
 	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	fmt.Fprintf(l.f, "%s "+format+"\n", append(
-		[]interface{}{time.Now().UTC().Format(time.RFC3339)}, args...,
-	)...)
+
+	_, _ = fmt.Fprintf(
+		l.f,
+		"%s "+format+"\n",
+		append(
+			[]interface{}{time.Now().UTC().Format(time.RFC3339)},
+			args...,
+		)...,
+	)
 }
 
 func (l *fileLogger) Close() error {
 	if l == nil || l.f == nil {
 		return nil
 	}
+
 	return l.f.Close()
 }
 
 func (p *Plugin) OnActivate() error {
 	loadDotEnvFile(defaultDotEnvPath())
 
-	p.setClient(&http.Client{Timeout: defaultTimeoutSeconds * time.Second})
+	p.setClient(&http.Client{
+		Timeout: defaultTimeoutSeconds * time.Second,
+	})
 
 	p.mu.Lock()
 	p.config = defaultConfiguration()
@@ -158,35 +201,43 @@ func (p *Plugin) OnActivate() error {
 	if err := p.reloadConfiguration(); err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// defaultDebugLogPath returns the default debug log location beside the
-// plugin executable, used when DebugLogPath is left blank.
+func (p *Plugin) OnDeactivate() error {
+	p.wg.Wait()
+	p.setDebugLog(nil)
+	return nil
+}
+
+func (p *Plugin) OnConfigurationChange() error {
+	// Re-read .env every time configuration is reloaded.
+	loadDotEnvFile(defaultDotEnvPath())
+	return p.reloadConfiguration()
+}
+
 func defaultDebugLogPath() string {
 	exe, err := os.Executable()
 	if err != nil {
 		return "mention-notifier-debug.log"
 	}
-	return filepath.Join(filepath.Dir(exe), "mention-notifier-debug.log")
+
+	return filepath.Join(
+		filepath.Dir(exe),
+		"mention-notifier-debug.log",
+	)
 }
 
-// defaultDotEnvPath returns the path to an optional .env file living
-// beside the plugin executable, mirroring how CSVPath resolves relative
-// paths.
 func defaultDotEnvPath() string {
 	exe, err := os.Executable()
 	if err != nil {
 		return ""
 	}
+
 	return filepath.Join(filepath.Dir(exe), ".env")
 }
 
-// loadDotEnvFile reads simple KEY=VALUE lines from path and applies them
-// to the process environment via os.Setenv, skipping blank lines,
-// '#'-prefixed comments, and any key that's already set in the
-// environment (explicit environment variables always win over the file).
-// Missing files are silently ignored - the .env file is optional.
 func loadDotEnvFile(path string) {
 	if path == "" {
 		return
@@ -199,6 +250,7 @@ func loadDotEnvFile(path string) {
 
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
+
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -212,28 +264,22 @@ func loadDotEnvFile(path string) {
 		if key == "" {
 			continue
 		}
-		if _, alreadySet := os.LookupEnv(key); alreadySet {
+
+		// Explicit process environment wins over .env.
+		if _, exists := os.LookupEnv(key); exists {
 			continue
 		}
 
 		value := strings.TrimSpace(parts[1])
 		value = strings.Trim(value, `"'`)
-		os.Setenv(key, value)
+
+		_ = os.Setenv(key, value)
 	}
-}
-
-func (p *Plugin) OnDeactivate() error {
-	p.wg.Wait()
-	p.setDebugLog(nil)
-	return nil
-}
-
-func (p *Plugin) OnConfigurationChange() error {
-	return p.reloadConfiguration()
 }
 
 func (p *Plugin) reloadConfiguration() error {
 	config := defaultConfiguration()
+
 	if err := p.API.LoadPluginConfiguration(&config); err != nil {
 		return fmt.Errorf("load plugin configuration: %w", err)
 	}
@@ -241,7 +287,13 @@ func (p *Plugin) reloadConfiguration() error {
 	config.TeamIDs = normalizeIDList(config.TeamIDs)
 	config.ChannelIDs = normalizeIDList(config.ChannelIDs)
 	config.Provider = normalizeProvider(config.Provider)
-	applyKavenegarEnvOverrides(&config)
+
+	// Environment values override Mattermost System Console values.
+	applyEnvOverrides(&config)
+
+	config.TeamIDs = normalizeIDList(config.TeamIDs)
+	config.ChannelIDs = normalizeIDList(config.ChannelIDs)
+	config.Provider = normalizeProvider(config.Provider)
 
 	if err := validateConfiguration(config); err != nil {
 		return err
@@ -262,22 +314,32 @@ func (p *Plugin) reloadConfiguration() error {
 	p.table = table
 	p.mu.Unlock()
 
-	// Guarded by setClient so notify() never reads a client concurrently
-	// with this write (previously a data race).
-	p.setClient(&http.Client{Timeout: timeout})
+	p.setClient(&http.Client{
+		Timeout: timeout,
+	})
 
 	if config.DebugLogging {
 		path := strings.TrimSpace(config.DebugLogPath)
+
 		if path == "" {
 			path = defaultDebugLogPath()
 		}
+
 		logger, err := openFileLogger(path)
 		if err != nil {
-			p.API.LogError("failed to open debug log file", "path", path, "error", err.Error())
+			p.API.LogError(
+				"failed to open debug log file",
+				"path", path,
+				"error", err.Error(),
+			)
 			p.setDebugLog(nil)
 		} else {
 			p.setDebugLog(logger)
-			p.API.LogInfo("debug logging enabled", "path", path)
+
+			p.API.LogInfo(
+				"debug logging enabled",
+				"path", path,
+			)
 		}
 	} else {
 		p.setDebugLog(nil)
@@ -290,6 +352,18 @@ func (p *Plugin) reloadConfiguration() error {
 		"channels", len(config.ChannelIDs),
 		"csv_entries", len(table),
 		"timeout_seconds", config.TimeoutSeconds,
+		"debug_logging", config.DebugLogging,
+	)
+
+	// Never log secrets.
+	p.debugf(
+		"CONFIG provider=%s enabled=%t teams=%v channels=%v csv_entries=%d timeout=%d",
+		config.Provider,
+		config.Enabled,
+		config.TeamIDs,
+		config.ChannelIDs,
+		len(table),
+		config.TimeoutSeconds,
 	)
 
 	return nil
@@ -304,20 +378,24 @@ func (p *Plugin) setClient(c *http.Client) {
 func (p *Plugin) getClient() *http.Client {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	return p.client
 }
 
-// setDebugLog swaps in a new debug log file, closing the previous one (if
-// any) after releasing the lock so a slow Close() never blocks readers.
 func (p *Plugin) setDebugLog(l *fileLogger) {
 	p.mu.Lock()
+
 	old := p.debugLog
 	p.debugLog = l
+
 	p.mu.Unlock()
 
 	if old != nil {
 		if err := old.Close(); err != nil {
-			p.API.LogError("failed to close debug log file", "error", err.Error())
+			p.API.LogError(
+				"failed to close debug log file",
+				"error", err.Error(),
+			)
 		}
 	}
 }
@@ -325,11 +403,10 @@ func (p *Plugin) setDebugLog(l *fileLogger) {
 func (p *Plugin) getDebugLog() *fileLogger {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	return p.debugLog
 }
 
-// debugf writes a line to the debug log file if DebugLogging is enabled.
-// No-op (and cheap) when disabled.
 func (p *Plugin) debugf(format string, args ...interface{}) {
 	if l := p.getDebugLog(); l != nil {
 		l.Printf(format, args...)
@@ -345,6 +422,7 @@ func (p *Plugin) MessageHasBeenPosted(
 	}
 
 	config := p.getConfiguration()
+
 	if !config.Enabled {
 		return
 	}
@@ -358,6 +436,7 @@ func (p *Plugin) MessageHasBeenPosted(
 		)
 		return
 	}
+
 	if channel == nil {
 		p.API.LogError(
 			"failed to resolve channel for post",
@@ -379,65 +458,108 @@ func (p *Plugin) MessageHasBeenPosted(
 	}
 
 	mentions := extractMentions(post.Message)
+
 	if len(mentions) == 0 {
 		return
 	}
 
 	p.debugf(
 		"TAGGED post_id=%s channel_id=%s team_id=%s mentions=%v message=%q",
-		post.Id, post.ChannelId, teamID, mentions, post.Message,
+		post.Id,
+		post.ChannelId,
+		teamID,
+		mentions,
+		post.Message,
 	)
 
 	seen := make(map[string]struct{}, len(mentions))
+
 	for _, token := range mentions {
 		targets := []string{token}
 
 		if config.ExpandGroupMentions {
 			if members, isGroup := p.resolveGroupMembers(token); isGroup {
-				// token matched a real Mattermost Group: notify its
-				// members instead of treating "token" as a username.
 				targets = members
-				p.debugf("GROUP token=%s members=%v", token, members)
+
+				p.debugf(
+					"GROUP token=%s members=%v",
+					token,
+					members,
+				)
 			}
 		}
 
 		for _, name := range targets {
 			name = strings.ToLower(strings.TrimSpace(name))
+
 			if name == "" {
 				continue
 			}
+
 			if _, exists := seen[name]; exists {
 				continue
 			}
+
 			seen[name] = struct{}{}
 
 			number := p.lookup(name)
+
 			if number == "" {
 				p.API.LogDebug(
 					"mentioned user has no CSV mapping",
 					"username", name,
 				)
-				p.debugf("EXTRACTED user=%s from_token=%s number=<no csv mapping>", name, token)
+
+				p.debugf(
+					"EXTRACTED user=%s from_token=%s number=<no csv mapping>",
+					name,
+					token,
+				)
+
 				continue
 			}
 
-			p.debugf("EXTRACTED user=%s from_token=%s number=%s", name, token, number)
+			p.debugf(
+				"EXTRACTED user=%s from_token=%s number=%s",
+				name,
+				token,
+				number,
+			)
 
 			p.wg.Add(1)
-			go func(name, number, teamID string, post *model.Post, config Configuration) {
+
+			go func(
+				name,
+				number,
+				teamID string,
+				post *model.Post,
+				config Configuration,
+			) {
 				defer p.wg.Done()
-				p.notify(config, name, number, teamID, post)
-			}(name, number, teamID, post, config)
+
+				p.notify(
+					config,
+					name,
+					number,
+					teamID,
+					post,
+				)
+			}(
+				name,
+				number,
+				teamID,
+				post,
+				config,
+			)
 		}
 	}
 }
 
-// resolveGroupMembers checks whether token matches a real Mattermost Group
-// by name. If it does, it returns every member's lowercased username and
-// true. If token doesn't match a group, it returns (nil, false) and the
-// caller should treat token as a plain @username mention instead.
-func (p *Plugin) resolveGroupMembers(token string) ([]string, bool) {
+func (p *Plugin) resolveGroupMembers(
+	token string,
+) ([]string, bool) {
 	group, appErr := p.API.GetGroupByName(token)
+
 	if appErr != nil || group == nil {
 		return nil, false
 	}
@@ -449,29 +571,40 @@ func (p *Plugin) resolveGroupMembers(token string) ([]string, bool) {
 			"group", token,
 			"error", err.Error(),
 		)
-		// The group exists but we couldn't list its members - do not fall
-		// back to treating "token" as a literal username, since it almost
-		// certainly isn't one.
+
 		return nil, true
 	}
 
 	return usernames, true
 }
 
-func (p *Plugin) groupMemberUsernames(groupID string) ([]string, error) {
+func (p *Plugin) groupMemberUsernames(
+	groupID string,
+) ([]string, error) {
 	const perPage = 200
 
 	var usernames []string
+
 	for page := 0; ; page++ {
-		users, appErr := p.API.GetGroupMemberUsers(groupID, page, perPage)
+		users, appErr := p.API.GetGroupMemberUsers(
+			groupID,
+			page,
+			perPage,
+		)
+
 		if appErr != nil {
 			return nil, errors.New(appErr.Error())
 		}
+
 		for _, u := range users {
 			if u != nil && u.Username != "" {
-				usernames = append(usernames, strings.ToLower(u.Username))
+				usernames = append(
+					usernames,
+					strings.ToLower(u.Username),
+				)
 			}
 		}
+
 		if len(users) < perPage {
 			break
 		}
@@ -483,6 +616,7 @@ func (p *Plugin) groupMemberUsernames(groupID string) ([]string, error) {
 func (p *Plugin) getConfiguration() Configuration {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	return p.config
 }
 
@@ -496,38 +630,51 @@ func (p *Plugin) isMonitoredScope(
 		matchesConfiguredID(channelID, channelIDs)
 }
 
-func matchesConfiguredID(value string, configured []string) bool {
+func matchesConfiguredID(
+	value string,
+	configured []string,
+) bool {
 	if len(configured) == 0 {
 		return true
 	}
+
 	for _, item := range configured {
 		if item == value {
 			return true
 		}
 	}
+
 	return false
 }
 
 func (p *Plugin) lookup(name string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	return p.table[name]
 }
 
 func loadCSV(configuredPath string) (map[string]string, error) {
 	filename := strings.TrimSpace(configuredPath)
+
 	if filename == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return nil, err
+		filename = "data.csv"
+	}
+
+	if !filepath.IsAbs(filename) {
+		if exe, err := os.Executable(); err == nil {
+			filename = filepath.Join(
+				filepath.Dir(exe),
+				filename,
+			)
 		}
-		filename = filepath.Join(filepath.Dir(exe), "data.csv")
 	}
 
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
+
 	defer file.Close()
 
 	reader := csv.NewReader(file)
@@ -539,19 +686,23 @@ func loadCSV(configuredPath string) (map[string]string, error) {
 	}
 
 	table := make(map[string]string)
+
 	for i, row := range records {
 		if len(row) < 2 {
 			continue
 		}
+
 		name := normalizeUsername(row[0])
 		number := strings.TrimSpace(row[1])
 
 		if i == 0 && isCSVHeader(name, number) {
 			continue
 		}
+
 		if name == "" || number == "" {
 			continue
 		}
+
 		table[name] = number
 	}
 
@@ -561,18 +712,22 @@ func loadCSV(configuredPath string) (map[string]string, error) {
 func isCSVHeader(name, number string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	number = strings.ToLower(strings.TrimSpace(number))
-	return (name == "username" || name == "user" || name == "name") &&
-		(number == "number" || number == "phone" || number == "phone_number")
+
+	return (name == "username" ||
+		name == "user" ||
+		name == "name") &&
+		(number == "number" ||
+			number == "phone" ||
+			number == "phone_number")
 }
 
 func normalizeUsername(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	value = strings.TrimPrefix(value, "@")
+
 	return value
 }
 
-// notify dispatches a single notification through whichever provider is
-// configured.
 func (p *Plugin) notify(
 	config Configuration,
 	name string,
@@ -584,11 +739,32 @@ func (p *Plugin) notify(
 		return
 	}
 
+	p.debugf(
+		"NOTIFY provider=%s user=%s number=%s post_id=%s channel_id=%s",
+		config.Provider,
+		name,
+		number,
+		post.Id,
+		post.ChannelId,
+	)
+
 	switch config.Provider {
 	case providerKavenegar:
-		p.notifyKavenegar(config, name, number, post)
+		p.notifyKavenegar(
+			config,
+			name,
+			number,
+			post,
+		)
+
 	default:
-		p.notifyGeneric(config, name, number, teamID, post)
+		p.notifyGeneric(
+			config,
+			name,
+			number,
+			teamID,
+			post,
+		)
 	}
 }
 
@@ -599,9 +775,15 @@ func (p *Plugin) notifyGeneric(
 	teamID string,
 	post *model.Post,
 ) {
-	u, err := url.Parse(strings.TrimSpace(config.NotifyURL))
+	u, err := url.Parse(
+		strings.TrimSpace(config.NotifyURL),
+	)
+
 	if err != nil {
-		p.API.LogError("invalid notification URL", "error", err.Error())
+		p.API.LogError(
+			"invalid notification URL",
+			"error", err.Error(),
+		)
 		return
 	}
 
@@ -617,19 +799,44 @@ func (p *Plugin) notifyGeneric(
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		p.API.LogError("failed to encode notification", "error", err.Error())
+		p.API.LogError(
+			"failed to encode notification",
+			"error", err.Error(),
+		)
 		return
 	}
 
-	req, err := http.NewRequest(http.MethodPost, u.String(), strings.NewReader(string(body)))
+	req, err := http.NewRequest(
+		http.MethodPost,
+		u.String(),
+		strings.NewReader(string(body)),
+	)
 	if err != nil {
-		p.API.LogError("failed to create HTTP request", "error", err.Error())
+		p.API.LogError(
+			"failed to create HTTP request",
+			"error", err.Error(),
+		)
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
+
+	req.Header.Set(
+		"Content-Type",
+		"application/json",
+	)
+
 	if token := strings.TrimSpace(config.AuthToken); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set(
+			"Authorization",
+			"Bearer "+token,
+		)
 	}
+
+	p.debugf(
+		"GENERIC REQUEST user=%s number=%s url=%s",
+		name,
+		number,
+		u.String(),
+	)
 
 	resp, err := p.clientFor(config).Do(req)
 	if err != nil {
@@ -638,14 +845,33 @@ func (p *Plugin) notifyGeneric(
 			"name", name,
 			"error", err.Error(),
 		)
-		p.debugf("GENERIC RESPONSE user=%s number=%s error=%s", name, number, err.Error())
+
+		p.debugf(
+			"GENERIC RESPONSE user=%s number=%s error=%s",
+			name,
+			number,
+			err.Error(),
+		)
+
 		return
 	}
+
 	defer resp.Body.Close()
 
-	p.debugf("GENERIC RESPONSE user=%s number=%s http_status=%d", name, number, resp.StatusCode)
+	responseBody, readErr := io.ReadAll(resp.Body)
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+	p.debugf(
+		"GENERIC RESPONSE user=%s number=%s http_status=%d body=%q read_error=%v",
+		name,
+		number,
+		resp.StatusCode,
+		string(responseBody),
+		readErr,
+	)
+
+	if resp.StatusCode < http.StatusOK ||
+		resp.StatusCode >= http.StatusMultipleChoices {
+
 		p.API.LogError(
 			"notification returned non-2xx",
 			"name", name,
@@ -654,34 +880,6 @@ func (p *Plugin) notifyGeneric(
 	}
 }
 
-// applyKavenegarEnvOverrides lets KAVENEGAR_API_KEY / KAVENEGAR_API_URL in
-// the process environment (or a .env file, see loadDotEnvFile) take
-// priority over the same values configured in the System Console. This
-// keeps the API key out of config.json.
-func applyKavenegarEnvOverrides(config *Configuration) {
-	if v := strings.TrimSpace(os.Getenv(envKavenegarAPIKey)); v != "" {
-		config.KavenegarAPIKey = v
-	}
-	if v := strings.TrimSpace(os.Getenv(envKavenegarAPIURL)); v != "" {
-		config.KavenegarAPIURL = v
-	}
-}
-
-// kavenegarEndpoint builds the "sms/send.json" URL for the given API key,
-// using config.KavenegarAPIURL as the base if set, otherwise falling back
-// to KavehNegar's default API host.
-func kavenegarEndpoint(config Configuration, apiKey string) string {
-	base := strings.TrimSpace(config.KavenegarAPIURL)
-	if base == "" {
-		base = defaultKavenegarAPIBase
-	}
-	base = strings.TrimRight(base, "/")
-	return fmt.Sprintf("%s/%s/sms/send.json", base, url.PathEscape(apiKey))
-}
-
-// notifyKavenegar sends an SMS via the KavehNegar REST API:
-// GET https://api.kavenegar.com/v1/{API-KEY}/sms/send.json?receptor=...&sender=...&message=...
-// Docs: https://kavenegar.com/rest.html
 func (p *Plugin) notifyKavenegar(
 	config Configuration,
 	name string,
@@ -689,33 +887,139 @@ func (p *Plugin) notifyKavenegar(
 	post *model.Post,
 ) {
 	apiKey := strings.TrimSpace(config.KavenegarAPIKey)
+
 	if apiKey == "" {
-		p.API.LogError("kavenegar_api_key is not configured")
+		p.API.LogError(
+			"kavenegar_api_key is not configured",
+		)
+
+		p.debugf(
+			"KAVENEGAR ERROR user=%s reason=no_api_key",
+			name,
+		)
+
 		return
 	}
 
 	receptor := normalizeIranianNumber(number)
+
 	if receptor == "" {
-		p.API.LogError("no usable phone number for recipient", "name", name)
+		p.API.LogError(
+			"no usable phone number for recipient",
+			"name", name,
+		)
+
+		p.debugf(
+			"KAVENEGAR ERROR user=%s reason=no_receptor",
+			name,
+		)
+
 		return
 	}
 
-	message := renderKavenegarMessage(config.KavenegarTemplate, name, post.Message)
+	// Resolve the Mattermost user who created the post.
+	senderName := post.UserId
 
-	endpoint := kavenegarEndpoint(config, apiKey)
+	user, appErr := p.API.GetUser(post.UserId)
+	if appErr == nil && user != nil {
+		senderName = user.GetDisplayName(model.ShowNicknameFullName)
+
+		if strings.TrimSpace(senderName) == "" {
+			senderName = user.Username
+		}
+	}
+
+	// Resolve the Mattermost channel name.
+	channelName := post.ChannelId
+
+	channel, appErr := p.API.GetChannel(post.ChannelId)
+	if appErr == nil && channel != nil {
+		channelName = channel.DisplayName
+
+		if strings.TrimSpace(channelName) == "" {
+			channelName = channel.Name
+		}
+	}
+
+	// Build the SMS text from MENTION_NOTIFIER_TEXT.
+	//
+	// Supported:
+	//   {{user}}
+	//   {{channel}}
+	//   {{message}}
+	message := strings.TrimSpace(config.Text)
+
+	if message == "" {
+		message = "{{user}} شما را در {{channel}} تگ کرد"
+	}
+
+	message = strings.ReplaceAll(
+		message,
+		"{{user}}",
+		senderName,
+	)
+
+	message = strings.ReplaceAll(
+		message,
+		"{{channel}}",
+		channelName,
+	)
+
+	message = strings.ReplaceAll(
+		message,
+		"{{message}}",
+		post.Message,
+	)
+
+	endpoint := kavenegarEndpoint(
+		config,
+		apiKey,
+	)
 
 	q := url.Values{}
+
 	q.Set("receptor", receptor)
 	q.Set("message", message)
-	if sender := strings.TrimSpace(config.KavenegarSender); sender != "" {
+
+	// Sender is optional.
+	// Do not send it unless explicitly configured.
+	sender := strings.TrimSpace(config.KavenegarSender)
+
+	if sender != "" {
 		q.Set("sender", sender)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, endpoint+"?"+q.Encode(), nil)
+	p.debugf(
+		"KAVENEGAR REQUEST user=%s receptor=%s sender=%q sms=%q channel=%s sender_user=%s",
+		name,
+		receptor,
+		sender,
+		message,
+		channelName,
+		senderName,
+	)
+
+	req, err := http.NewRequest(
+		http.MethodGet,
+		endpoint+"?"+q.Encode(),
+		nil,
+	)
 	if err != nil {
-		p.API.LogError("failed to create KavehNegar request", "error", err.Error())
+		p.API.LogError(
+			"failed to create KavehNegar request",
+			"error", err.Error(),
+		)
+
+		p.debugf(
+			"KAVENEGAR ERROR user=%s reason=create_request error=%s",
+			name,
+			err.Error(),
+		)
+
 		return
 	}
+
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := p.clientFor(config).Do(req)
 	if err != nil {
@@ -724,32 +1028,83 @@ func (p *Plugin) notifyKavenegar(
 			"name", name,
 			"error", err.Error(),
 		)
-		p.debugf("KAVENEGAR RESPONSE user=%s number=%s error=%s", name, number, err.Error())
+
+		p.debugf(
+			"KAVENEGAR ERROR user=%s number=%s reason=http_request error=%s",
+			name,
+			number,
+			err.Error(),
+		)
+
 		return
 	}
+
 	defer resp.Body.Close()
 
-	// KavehNegar returns HTTP 200 even for some API-level errors (e.g. bad
-	// credit, invalid sender), so the response body must be checked too.
-	var parsed kavenegarResponse
-	decodeErr := json.NewDecoder(resp.Body).Decode(&parsed)
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		p.API.LogError(
+			"failed to read kavenegar response",
+			"name", name,
+			"error", err.Error(),
+		)
+
+		p.debugf(
+			"KAVENEGAR ERROR user=%s reason=read_response error=%s",
+			name,
+			err.Error(),
+		)
+
+		return
+	}
 
 	p.debugf(
-		"KAVENEGAR RESPONSE user=%s number=%s http_status=%d api_status=%d api_message=%q decode_error=%v",
-		name, number, resp.StatusCode, parsed.Return.Status, parsed.Return.Message, decodeErr,
+		"KAVENEGAR RESPONSE user=%s number=%s http_status=%d content_type=%q body=%q",
+		name,
+		number,
+		resp.StatusCode,
+		resp.Header.Get("Content-Type"),
+		string(responseBody),
 	)
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		p.API.LogError(
-			"kavenegar returned non-2xx",
-			"name", name,
-			"status", resp.Status,
-		)
+	var parsed kavenegarResponse
+
+	decodeErr := json.Unmarshal(
+		responseBody,
+		&parsed,
+	)
+
+	if resp.StatusCode < http.StatusOK ||
+		resp.StatusCode >= http.StatusMultipleChoices {
+
+		if decodeErr == nil {
+			p.API.LogError(
+				"kavenegar returned non-2xx",
+				"name", name,
+				"status", resp.Status,
+				"api_status", parsed.Return.Status,
+				"api_message", parsed.Return.Message,
+			)
+		} else {
+			p.API.LogError(
+				"kavenegar returned non-2xx",
+				"name", name,
+				"status", resp.Status,
+				"response", string(responseBody),
+			)
+		}
+
 		return
 	}
 
 	if decodeErr != nil {
-		p.API.LogError("failed to decode kavenegar response", "error", decodeErr.Error())
+		p.API.LogError(
+			"failed to decode kavenegar response",
+			"name", name,
+			"error", decodeErr.Error(),
+			"response", string(responseBody),
+		)
+
 		return
 	}
 
@@ -760,40 +1115,176 @@ func (p *Plugin) notifyKavenegar(
 			"status", parsed.Return.Status,
 			"message", parsed.Return.Message,
 		)
+
+		return
+	}
+
+	p.API.LogInfo(
+		"kavenegar SMS accepted",
+		"name", name,
+		"sender_user", senderName,
+		"channel", channelName,
+		"status", parsed.Return.Status,
+	)
+}
+
+func applyEnvOverrides(config *Configuration) {
+	// Generic notifier settings.
+
+	if v, ok := os.LookupEnv(envNotifierEnabled); ok {
+		if parsed, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			config.Enabled = parsed
+		}
+	}
+
+	if v, ok := os.LookupEnv(envNotifierTeamIDs); ok {
+		config.TeamIDs = parseEnvIDList(v)
+	}
+
+	if v, ok := os.LookupEnv(envNotifierChannelIDs); ok {
+		config.ChannelIDs = parseEnvIDList(v)
+	}
+
+	if v, ok := os.LookupEnv(envNotifierProvider); ok &&
+		strings.TrimSpace(v) != "" {
+		config.Provider = normalizeProvider(v)
+	}
+
+	if v, ok := os.LookupEnv(envNotifierNotifyURL); ok {
+		config.NotifyURL = strings.TrimSpace(v)
+	}
+
+	if v, ok := os.LookupEnv(envNotifierAuthToken); ok {
+		config.AuthToken = strings.TrimSpace(v)
+	}
+
+	if v, ok := os.LookupEnv(envNotifierCSVFile); ok &&
+		strings.TrimSpace(v) != "" {
+		config.CSVPath = strings.TrimSpace(v)
+	}
+
+	if v, ok := os.LookupEnv(envNotifierTimeout); ok {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			config.TimeoutSeconds = parsed
+		}
+	}
+
+	if v, ok := os.LookupEnv(envNotifierExpandGroups); ok {
+		if parsed, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			config.ExpandGroupMentions = parsed
+		}
+	}
+
+	if v, ok := os.LookupEnv(envNotifierDebugLogging); ok {
+		if parsed, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			config.DebugLogging = parsed
+		}
+	}
+
+	if v, ok := os.LookupEnv(envNotifierDebugLogPath); ok {
+		config.DebugLogPath = strings.TrimSpace(v)
+	}
+
+	// SMS text.
+	//
+	// This takes precedence over the System Console Text setting.
+	if v, ok := os.LookupEnv(envNotifierText); ok {
+		config.Text = strings.TrimSpace(v)
+	}
+
+	// KavehNegar settings.
+
+	if v := strings.TrimSpace(os.Getenv(envKavenegarAPIKey)); v != "" {
+		config.KavenegarAPIKey = v
+	}
+
+	if v := strings.TrimSpace(os.Getenv(envKavenegarAPIURL)); v != "" {
+		config.KavenegarAPIURL = v
+	}
+
+	if v := strings.TrimSpace(os.Getenv(envKavenegarSender)); v != "" {
+		config.KavenegarSender = v
+	}
+
+	if v := os.Getenv(envKavenegarTemplate); v != "" {
+		config.KavenegarTemplate = v
 	}
 }
 
-func (p *Plugin) clientFor(config Configuration) *http.Client {
-	if client := p.getClient(); client != nil {
-		return client
+func parseEnvIDList(value string) stringList {
+	parts := strings.Split(value, ",")
+
+	result := make(stringList, 0, len(parts))
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+
+		if part != "" {
+			result = append(result, part)
+		}
 	}
-	timeout := time.Duration(config.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = defaultTimeoutSeconds * time.Second
-	}
-	return &http.Client{Timeout: timeout}
+
+	return result
 }
 
-// renderKavenegarMessage fills a simple {{user}} / {{message}} template, or
-// falls back to a sane default if no template is configured.
-func renderKavenegarMessage(template, name, postMessage string) string {
+func kavenegarEndpoint(
+	config Configuration,
+	apiKey string,
+) string {
+	base := strings.TrimSpace(
+		config.KavenegarAPIURL,
+	)
+
+	if base == "" {
+		base = defaultKavenegarAPIBase
+	}
+
+	base = strings.TrimRight(base, "/")
+
+	return fmt.Sprintf(
+		"%s/%s/sms/send.json",
+		base,
+		url.PathEscape(apiKey),
+	)
+}
+
+func renderKavenegarMessage(
+	template string,
+	name string,
+	postMessage string,
+) string {
 	template = strings.TrimSpace(template)
+
 	if template == "" {
-		return fmt.Sprintf("You were mentioned by @%s: %s", name, postMessage)
+		return fmt.Sprintf(
+			"You were mentioned by @%s: %s",
+			name,
+			postMessage,
+		)
 	}
-	out := strings.ReplaceAll(template, "{{user}}", name)
-	out = strings.ReplaceAll(out, "{{message}}", postMessage)
+
+	out := strings.ReplaceAll(
+		template,
+		"{{user}}",
+		name,
+	)
+
+	out = strings.ReplaceAll(
+		out,
+		"{{message}}",
+		postMessage,
+	)
+
 	return out
 }
 
-// normalizeIranianNumber does light cleanup so CSV entries can be stored as
-// 0912xxxxxxx, +98912xxxxxxx, or 98912xxxxxxx and still work with KavehNegar,
-// which expects the receptor without a leading '+'.
 func normalizeIranianNumber(raw string) string {
 	number := strings.TrimSpace(raw)
+
 	number = strings.ReplaceAll(number, " ", "")
 	number = strings.ReplaceAll(number, "-", "")
 	number = strings.TrimPrefix(number, "+")
+
 	return number
 }
 
@@ -802,7 +1293,11 @@ var mentionRegexp = regexp.MustCompile(
 )
 
 func extractMentions(message string) []string {
-	matches := mentionRegexp.FindAllStringSubmatch(message, -1)
+	matches := mentionRegexp.FindAllStringSubmatch(
+		message,
+		-1,
+	)
+
 	result := make([]string, 0, len(matches))
 	seen := make(map[string]struct{})
 
@@ -810,17 +1305,22 @@ func extractMentions(message string) []string {
 		if len(match) < 2 {
 			continue
 		}
+
 		name := normalizeUsername(match[1])
-		// A trailing '.' or '-' is valid inside a username but almost
-		// always sentence punctuation when it's the very last character
-		// (e.g. "cc @charlie." at the end of a message), so trim it.
-		name = strings.TrimRight(name, ".-")
+
+		name = strings.TrimRight(
+			name,
+			".-",
+		)
+
 		if name == "" || isSpecialMention(name) {
 			continue
 		}
+
 		if _, exists := seen[name]; exists {
 			continue
 		}
+
 		seen[name] = struct{}{}
 		result = append(result, name)
 	}
@@ -848,31 +1348,48 @@ func defaultConfiguration() Configuration {
 }
 
 func normalizeProvider(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ToLower(
+		strings.TrimSpace(value),
+	)
+
 	if value == providerKavenegar {
 		return providerKavenegar
 	}
+
 	return providerGeneric
 }
 
-func validateConfiguration(config Configuration) error {
+func validateConfiguration(
+	config Configuration,
+) error {
 	if !config.Enabled {
 		return nil
 	}
 
 	switch config.Provider {
 	case providerKavenegar:
-		if strings.TrimSpace(config.KavenegarAPIKey) == "" {
-			return errors.New("kavenegar_api_key is required when provider is kavenegar")
+		if strings.TrimSpace(
+			config.KavenegarAPIKey,
+		) == "" {
+			return errors.New(
+				"kavenegar_api_key is required when provider is kavenegar",
+			)
 		}
+
 	default:
-		if err := validateNotifyURL(config.NotifyURL); err != nil {
+		if err := validateNotifyURL(
+			config.NotifyURL,
+		); err != nil {
 			return err
 		}
 	}
 
-	if config.TimeoutSeconds < 1 || config.TimeoutSeconds > maxTimeoutSeconds {
-		return fmt.Errorf("timeout_seconds must be between 1 and %d", maxTimeoutSeconds)
+	if config.TimeoutSeconds < 1 ||
+		config.TimeoutSeconds > maxTimeoutSeconds {
+		return fmt.Errorf(
+			"timeout_seconds must be between 1 and %d",
+			maxTimeoutSeconds,
+		)
 	}
 
 	return nil
@@ -880,33 +1397,71 @@ func validateConfiguration(config Configuration) error {
 
 func validateNotifyURL(rawURL string) error {
 	rawURL = strings.TrimSpace(rawURL)
+
 	if rawURL == "" {
-		return errors.New("notify_url is required when the plugin is enabled")
+		return errors.New(
+			"notify_url is required when the plugin is enabled",
+		)
 	}
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("invalid notify_url: %w", err)
+		return fmt.Errorf(
+			"invalid notify_url: %w",
+			err,
+		)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("notify_url must use http or https")
+
+	if u.Scheme != "http" &&
+		u.Scheme != "https" {
+		return errors.New(
+			"notify_url must use http or https",
+		)
 	}
+
 	if u.Host == "" {
-		return errors.New("notify_url must include a host")
+		return errors.New(
+			"notify_url must include a host",
+		)
 	}
 
 	return nil
 }
 
-func normalizeIDList(values []string) []string {
+func normalizeIDList(
+	values []string,
+) []string {
 	result := make([]string, 0, len(values))
+
 	for _, value := range values {
 		value = strings.TrimSpace(value)
+
 		if value != "" {
 			result = append(result, value)
 		}
 	}
+
 	return result
+}
+
+func (p *Plugin) clientFor(
+	config Configuration,
+) *http.Client {
+	if client := p.getClient(); client != nil {
+		return client
+	}
+
+	timeout := time.Duration(
+		config.TimeoutSeconds,
+	) * time.Second
+
+	if timeout <= 0 {
+		timeout = defaultTimeoutSeconds * time.Second
+	}
+
+	return &http.Client{
+		Timeout: timeout,
+	}
 }
 
 func main() {

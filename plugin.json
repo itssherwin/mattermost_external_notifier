@@ -31,18 +31,58 @@
         "help_text": "Comma-separated Mattermost channel IDs. Leave empty to allow all channels."
       },
       {
+        "key": "Provider",
+        "display_name": "Notification provider",
+        "type": "radio",
+        "options": [
+          { "display_name": "Generic HTTP webhook", "value": "generic" },
+          { "display_name": "KavehNegar SMS", "value": "kavenegar" }
+        ],
+        "default": "generic",
+        "help_text": "Choose how notifications are delivered. Generic posts JSON to Notification endpoint. KavehNegar sends an SMS via the KavehNegar REST API."
+      },
+      {
         "key": "NotifyURL",
         "display_name": "Notification endpoint",
         "type": "text",
         "default": "",
-        "help_text": "HTTP or HTTPS endpoint that receives one POST request per matched mention."
+        "help_text": "HTTP or HTTPS endpoint that receives one POST request per matched mention. Used only when Provider is Generic HTTP webhook."
       },
       {
         "key": "AuthToken",
         "display_name": "Bearer token",
         "type": "text",
         "default": "",
-        "help_text": "Optional bearer token sent as the Authorization header."
+        "help_text": "Optional bearer token sent as the Authorization header. Used only when Provider is Generic HTTP webhook."
+      },
+      {
+        "key": "KavenegarAPIKey",
+        "display_name": "KavehNegar API key",
+        "type": "text",
+        "secret": true,
+        "default": "",
+        "help_text": "Your KavehNegar API key, from https://panel.kavenegar.com/client/setting/account. Required when Provider is KavehNegar SMS. Can also be set via the KAVENEGAR_API_KEY environment variable, which takes priority over this field."
+      },
+      {
+        "key": "KavenegarAPIURL",
+        "display_name": "KavehNegar API base URL",
+        "type": "text",
+        "default": "",
+        "help_text": "Optional. Defaults to https://api.kavenegar.com/v1 if left blank. Can also be set via the KAVENEGAR_API_URL environment variable, which takes priority over this field."
+      },
+      {
+        "key": "KavenegarSender",
+        "display_name": "KavehNegar sender line",
+        "type": "text",
+        "default": "",
+        "help_text": "Optional. The sender line/number configured on your KavehNegar account. Leave blank to use your account default."
+      },
+      {
+        "key": "KavenegarTemplate",
+        "display_name": "SMS message template",
+        "type": "text",
+        "default": "",
+        "help_text": "Optional. Use {{user}} and {{message}} as placeholders. If left blank, a default template is used."
       },
       {
         "key": "CSVPath",
@@ -57,6 +97,27 @@
         "type": "number",
         "default": 10,
         "help_text": "HTTP request timeout from 1 to 120 seconds."
+      },
+      {
+        "key": "ExpandGroupMentions",
+        "display_name": "Expand @group mentions to members",
+        "type": "bool",
+        "default": true,
+        "help_text": "When enabled, mentioning a Mattermost Group (e.g. @on-call) notifies every member of that group, in addition to plain @username mentions."
+      },
+      {
+        "key": "DebugLogging",
+        "display_name": "Debug logging",
+        "type": "bool",
+        "default": false,
+        "help_text": "Appends verbose diagnostics (tagged messages, extracted mentions, numbers, and provider response codes) to a log file in plain text. Only enable while actively troubleshooting - see the README security note before enabling in production."
+      },
+      {
+        "key": "DebugLogPath",
+        "display_name": "Debug log path",
+        "type": "text",
+        "default": "",
+        "help_text": "Optional. Defaults to mention-notifier-debug.log beside the plugin executable if left blank. Only used when Debug logging is enabled."
       }
     ]
   }
