@@ -71,6 +71,13 @@
         "help_text": "Optional. Defaults to https://api.kavenegar.com/v1 if left blank. Can also be set via the KAVENEGAR_API_URL environment variable, which takes priority over this field."
       },
       {
+        "key": "KavenegarTemplateName",
+        "display_name": "KavehNegar template name",
+        "type": "text",
+        "default": "",
+        "help_text": "Optional. The name of a pre-approved template in your KavehNegar panel (e.g. MattermostMentionNotify). When set, notifications use KavehNegar's faster verify/lookup API with this template instead of a plain SMS, and KavehNegar sender line / SMS message template below are ignored."
+      },
+      {
         "key": "KavenegarSender",
         "display_name": "KavehNegar sender line",
         "type": "text",

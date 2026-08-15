@@ -41,11 +41,13 @@ const (
 	envNotifierDebugLogging = "MENTION_NOTIFIER_DEBUG_LOGGING"
 	envNotifierDebugLogPath = "MENTION_NOTIFIER_DEBUG_LOG_PATH"
 	envNotifierText          = "MENTION_NOTIFIER_TEXT"
+	envNotifierSiteURL       = "MENTION_NOTIFIER_SITE_URL"
 
 	envKavenegarAPIKey       = "KAVENEGAR_API_KEY"
 	envKavenegarAPIURL       = "KAVENEGAR_API_URL"
 	envKavenegarSender       = "KAVENEGAR_SENDER"
 	envKavenegarTemplate     = "KAVENEGAR_TEMPLATE"
+	envKavenegarTemplateName = "KAVENEGAR_TEMPLATE_NAME"
 )
 
 type Plugin struct {
@@ -99,6 +101,14 @@ type Configuration struct {
 	KavenegarSender   string `json:"KavenegarSender"`
 	KavenegarTemplate string `json:"KavenegarTemplate"`
 
+	// KavenegarTemplateName, when set, switches delivery from plain
+	// sms/send.json to KavehNegar's verify/lookup.json endpoint using
+	// this pre-approved template name. Faster and higher priority than a
+	// plain SMS. When set, KavenegarSender / KavenegarTemplate / Text are
+	// ignored for this recipient, since the message text lives in the
+	// KavehNegar-side template instead.
+	KavenegarTemplateName string `json:"KavenegarTemplateName"`
+
 	// MENTION_NOTIFIER_TEXT overrides the SMS text.
 	//
 	// Supported placeholders:
@@ -106,6 +116,13 @@ type Configuration struct {
 	//   {{channel}} - Mattermost channel name
 	//   {{message}} - original Mattermost post message
 	Text string `json:"Text"`
+
+	// SiteURL overrides Mattermost's own ServiceSettings.SiteURL when
+	// building the post permalink sent as %token to a KavehNegar
+	// verify/lookup template. Leave blank to use Mattermost's real
+	// SiteURL config - this only matters if that's unset, wrong for your
+	// use case, or you want the link to point somewhere else entirely.
+	SiteURL string `json:"SiteURL"`
 
 	CSVPath        string `json:"CSVPath"`
 	TimeoutSeconds int    `json:"TimeoutSeconds"`
@@ -768,12 +785,22 @@ func (p *Plugin) notify(
 
 	switch config.Provider {
 	case providerKavenegar:
-		p.notifyKavenegar(
-			config,
-			name,
-			number,
-			post,
-		)
+		if strings.TrimSpace(config.KavenegarTemplateName) != "" {
+			p.notifyKavenegarTemplate(
+				config,
+				name,
+				number,
+				teamID,
+				post,
+			)
+		} else {
+			p.notifyKavenegar(
+				config,
+				name,
+				number,
+				post,
+			)
+		}
 
 	default:
 		p.notifyGeneric(
@@ -935,29 +962,9 @@ func (p *Plugin) notifyKavenegar(
 		return
 	}
 
-	// Resolve the Mattermost user who created the post.
-	senderName := post.UserId
-
-	user, appErr := p.API.GetUser(post.UserId)
-	if appErr == nil && user != nil {
-		senderName = user.GetDisplayName(model.ShowNicknameFullName)
-
-		if strings.TrimSpace(senderName) == "" {
-			senderName = user.Username
-		}
-	}
-
-	// Resolve the Mattermost channel name.
-	channelName := post.ChannelId
-
-	channel, appErr := p.API.GetChannel(post.ChannelId)
-	if appErr == nil && channel != nil {
-		channelName = channel.DisplayName
-
-		if strings.TrimSpace(channelName) == "" {
-			channelName = channel.Name
-		}
-	}
+	// Resolve the Mattermost user who created the post, and the channel
+	// they posted in.
+	senderName, channelName := p.resolveSenderAndChannel(post)
 
 	// Build the SMS text from MENTION_NOTIFIER_TEXT.
 	//
@@ -992,6 +999,7 @@ func (p *Plugin) notifyKavenegar(
 	endpoint := kavenegarEndpoint(
 		config,
 		apiKey,
+		"sms/send.json",
 	)
 
 	q := url.Values{}
@@ -1102,6 +1110,7 @@ func (p *Plugin) notifyKavenegar(
 				"status", resp.Status,
 				"api_status", parsed.Return.Status,
 				"api_message", parsed.Return.Message,
+				"hint", kavenegarErrorHint(parsed.Return.Status),
 			)
 		} else {
 			p.API.LogError(
@@ -1132,6 +1141,7 @@ func (p *Plugin) notifyKavenegar(
 			"name", name,
 			"status", parsed.Return.Status,
 			"message", parsed.Return.Message,
+			"hint", kavenegarErrorHint(parsed.Return.Status),
 		)
 
 		return
@@ -1140,6 +1150,240 @@ func (p *Plugin) notifyKavenegar(
 	p.API.LogInfo(
 		"kavenegar SMS accepted",
 		"name", name,
+		"sender_user", senderName,
+		"channel", channelName,
+		"status", parsed.Return.Status,
+	)
+}
+
+// resolveSenderAndChannel resolves the display name of whoever created
+// post, and the display name of the channel it was posted in. Falls back
+// to raw IDs if either lookup fails, so callers always get a usable
+// (if less friendly) string instead of an error.
+func (p *Plugin) resolveSenderAndChannel(post *model.Post) (senderName string, channelName string) {
+	senderName = post.UserId
+
+	if user, appErr := p.API.GetUser(post.UserId); appErr == nil && user != nil {
+		senderName = user.GetDisplayName(model.ShowNicknameFullName)
+
+		if strings.TrimSpace(senderName) == "" {
+			senderName = user.Username
+		}
+	}
+
+	channelName = post.ChannelId
+
+	if channel, appErr := p.API.GetChannel(post.ChannelId); appErr == nil && channel != nil {
+		channelName = channel.DisplayName
+
+		if strings.TrimSpace(channelName) == "" {
+			channelName = channel.Name
+		}
+	}
+
+	return senderName, channelName
+}
+
+// postPermalink builds a Mattermost permalink to a post
+// ({SiteURL}/{team-name}/pl/{post-id}), used as the %token value sent to
+// KavehNegar's verify/lookup template. config.SiteURL (if set) takes
+// priority over Mattermost's own ServiceSettings.SiteURL. Falls back to a
+// bare post ID if no SiteURL is available or the team can't be resolved,
+// so the notification still carries something usable instead of failing
+// outright.
+func (p *Plugin) postPermalink(config Configuration, teamID string, postID string) string {
+	siteURL := strings.TrimRight(strings.TrimSpace(config.SiteURL), "/")
+
+	if siteURL == "" {
+		if cfg := p.API.GetConfig(); cfg != nil && cfg.ServiceSettings.SiteURL != nil {
+			siteURL = strings.TrimRight(*cfg.ServiceSettings.SiteURL, "/")
+		}
+	}
+
+	teamName := ""
+	if team, appErr := p.API.GetTeam(teamID); appErr == nil && team != nil {
+		teamName = team.Name
+	}
+
+	if siteURL == "" || teamName == "" {
+		return postID
+	}
+
+	return fmt.Sprintf("%s/%s/pl/%s", siteURL, teamName, postID)
+}
+
+// kavenegarErrorHint gives a short human-readable explanation for
+// KavehNegar's documented verify/lookup error codes, purely to make debug
+// logs easier to read at a glance. See https://kavenegar.com/rest.html
+func kavenegarErrorHint(status int) string {
+	switch status {
+	case 418:
+		return "insufficient account credit"
+	case 422:
+		return "receptor or token contains an invalid character"
+	case 424:
+		return "template not found or not yet approved"
+	case 426:
+		return "requires the advanced service to be enabled"
+	case 428:
+		return "call delivery requires a numeric-only token"
+	case 431:
+		return "token contains a newline, space, underscore, or separator"
+	case 432:
+		return "template does not define the token parameter used"
+	case 501:
+		return "account restricted to sending only to its own registered number - complete KavehNegar account verification to lift this"
+	case 607:
+		return "invalid tag name"
+	default:
+		return ""
+	}
+}
+
+// notifyKavenegarTemplate sends a notification via KavehNegar's
+// verify/lookup.json endpoint using a pre-approved template (configured
+// in the KavehNegar panel), instead of a freeform SMS body. Faster and
+// higher priority than a plain SMS, but every token placeholder used by
+// the template must be supplied as a query parameter here.
+//
+// GET https://api.kavenegar.com/v1/{API-KEY}/verify/lookup.json?receptor=...&token=...&token10=...&token20=...&template=...
+// Docs: https://kavenegar.com/rest.html (Verify / Lookup)
+//
+// Written for a template shaped like:
+//
+//	%token10 شما را در گروه %token20 منشن کرده است. لینک پیام: %token
+//
+// where:
+//   - token   -> permalink URL to the post (KavehNegar disallows spaces
+//     in this field, which a URL naturally satisfies)
+//   - token10 -> the mentioning user's display name (up to 5 spaces
+//     allowed)
+//   - token20 -> the channel's display name (up to 8 spaces allowed)
+//
+// Adjust which fields are populated if your template uses
+// token/token2/token3 differently.
+func (p *Plugin) notifyKavenegarTemplate(
+	config Configuration,
+	name string,
+	number string,
+	teamID string,
+	post *model.Post,
+) {
+	apiKey := strings.TrimSpace(config.KavenegarAPIKey)
+	if apiKey == "" {
+		p.API.LogError("kavenegar_api_key is not configured")
+		p.debugf("KAVENEGAR VERIFY ERROR user=%s reason=no_api_key", name)
+		return
+	}
+
+	templateName := strings.TrimSpace(config.KavenegarTemplateName)
+	if templateName == "" {
+		p.API.LogError("kavenegar_template_name is not configured")
+		p.debugf("KAVENEGAR VERIFY ERROR user=%s reason=no_template_name", name)
+		return
+	}
+
+	receptor := normalizeIranianNumber(number)
+	if receptor == "" {
+		p.API.LogError("no usable phone number for recipient", "name", name)
+		p.debugf("KAVENEGAR VERIFY ERROR user=%s reason=no_receptor", name)
+		return
+	}
+
+	senderName, channelName := p.resolveSenderAndChannel(post)
+	link := p.postPermalink(config, teamID, post.Id)
+
+	endpoint := kavenegarEndpoint(config, apiKey, "verify/lookup.json")
+
+	q := url.Values{}
+	q.Set("receptor", receptor)
+	q.Set("template", templateName)
+	q.Set("token", link)
+	q.Set("token10", senderName)
+	q.Set("token20", channelName)
+
+	p.debugf(
+		"KAVENEGAR VERIFY REQUEST user=%s receptor=%s template=%s token=%s token10=%s token20=%s",
+		name, receptor, templateName, link, senderName, channelName,
+	)
+
+	req, err := http.NewRequest(http.MethodGet, endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		p.API.LogError("failed to create KavehNegar request", "error", err.Error())
+		p.debugf("KAVENEGAR VERIFY ERROR user=%s reason=create_request error=%s", name, err.Error())
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := p.clientFor(config).Do(req)
+	if err != nil {
+		p.API.LogError("kavenegar verify request failed", "name", name, "error", err.Error())
+		p.debugf("KAVENEGAR VERIFY ERROR user=%s number=%s reason=http_request error=%s", name, number, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		p.API.LogError("failed to read kavenegar verify response", "name", name, "error", err.Error())
+		p.debugf("KAVENEGAR VERIFY ERROR user=%s reason=read_response error=%s", name, err.Error())
+		return
+	}
+
+	p.debugf(
+		"KAVENEGAR VERIFY RESPONSE user=%s number=%s http_status=%d content_type=%q body=%q",
+		name, number, resp.StatusCode, resp.Header.Get("Content-Type"), string(responseBody),
+	)
+
+	var parsed kavenegarResponse
+	decodeErr := json.Unmarshal(responseBody, &parsed)
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if decodeErr == nil {
+			p.API.LogError(
+				"kavenegar verify returned non-2xx",
+				"name", name,
+				"status", resp.Status,
+				"api_status", parsed.Return.Status,
+				"api_message", parsed.Return.Message,
+				"hint", kavenegarErrorHint(parsed.Return.Status),
+			)
+		} else {
+			p.API.LogError(
+				"kavenegar verify returned non-2xx",
+				"name", name,
+				"status", resp.Status,
+				"response", string(responseBody),
+			)
+		}
+		return
+	}
+
+	if decodeErr != nil {
+		p.API.LogError(
+			"failed to decode kavenegar verify response",
+			"name", name,
+			"error", decodeErr.Error(),
+			"response", string(responseBody),
+		)
+		return
+	}
+
+	if parsed.Return.Status != http.StatusOK {
+		p.API.LogError(
+			"kavenegar rejected the verify request",
+			"name", name,
+			"status", parsed.Return.Status,
+			"hint", kavenegarErrorHint(parsed.Return.Status),
+			"message", parsed.Return.Message,
+		)
+		return
+	}
+
+	p.API.LogInfo(
+		"kavenegar verify SMS accepted",
+		"name", name,
+		"template", templateName,
 		"sender_user", senderName,
 		"channel", channelName,
 		"status", parsed.Return.Status,
@@ -1210,6 +1454,10 @@ func applyEnvOverrides(config *Configuration) {
 		config.Text = strings.TrimSpace(v)
 	}
 
+	if v, ok := os.LookupEnv(envNotifierSiteURL); ok {
+		config.SiteURL = strings.TrimSpace(v)
+	}
+
 	// KavehNegar settings.
 
 	if v := strings.TrimSpace(os.Getenv(envKavenegarAPIKey)); v != "" {
@@ -1226,6 +1474,10 @@ func applyEnvOverrides(config *Configuration) {
 
 	if v := os.Getenv(envKavenegarTemplate); v != "" {
 		config.KavenegarTemplate = v
+	}
+
+	if v := strings.TrimSpace(os.Getenv(envKavenegarTemplateName)); v != "" {
+		config.KavenegarTemplateName = v
 	}
 }
 
@@ -1248,6 +1500,7 @@ func parseEnvIDList(value string) stringList {
 func kavenegarEndpoint(
 	config Configuration,
 	apiKey string,
+	pathSuffix string,
 ) string {
 	base := strings.TrimSpace(
 		config.KavenegarAPIURL,
@@ -1260,9 +1513,10 @@ func kavenegarEndpoint(
 	base = strings.TrimRight(base, "/")
 
 	return fmt.Sprintf(
-		"%s/%s/sms/send.json",
+		"%s/%s/%s",
 		base,
 		url.PathEscape(apiKey),
+		pathSuffix,
 	)
 }
 
